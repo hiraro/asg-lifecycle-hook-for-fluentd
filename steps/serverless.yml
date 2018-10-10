@@ -1,0 +1,86 @@
+service: ec2-asg-lifecycle-hook-for-fluentd-steps
+
+custom:
+  defaultStage: dev
+  profiles:
+    dev: develop
+    prod: production
+
+provider:
+  name: aws
+  runtime: python3.6
+  region: ap-northeast-1
+  stage: ${opt:stage, self:custom.defaultStage}
+  profile: ${self:custom.profiles.${self:provider.stage}}
+  memorySize: 128
+  timeout: 5
+  environment:
+    TIMEOUT_SEC: ${env:TIMEOUT_SEC}
+    WAIT_TIME_SEC: ${env:WAIT_TIME_SEC}
+
+plugins:
+  - serverless-dotenv-plugin
+  - serverless-pseudo-parameters
+  - serverless-step-functions
+
+package:
+  individually: true
+  exclude:
+    - src/**
+
+functions:
+  send-signal:
+    name: ${self:provider.stage}-send-signal
+    handler: src/send-signal/app.lambda_handler
+    role: ${env:LAMBDA_ROLE_SSM}
+    package:
+      include:
+        - src/send-signal/**
+  complete-lifecycle-hook:
+    name: ${self:provider.stage}-complete-lifecycle-hook
+    handler: src/complete-lifecycle-hook/app.lambda_handler
+    role: ${env:LAMBDA_ROLE_AS}
+    package:
+      include:
+        - src/complete-lifecycle-hook/**
+
+stepFunctions:
+  stateMachines:
+    FluentdFlusher:
+      definition:
+        TimeoutSeconds: 600
+        StartAt: send-signal
+        States:
+          send-signal:
+            Type: Task
+            Resource: "arn:aws:lambda:#{AWS::Region}:#{AWS::AccountId}:function:${self:provider.stage}-send-signal"
+            Next: wait
+            Catch:
+              - ErrorEquals:
+                  - "States.ALL"
+                Next: failure
+            Retry:
+              - ErrorEquals:
+                  - "States.ALL"
+                MaxAttempts: 0
+
+          wait:
+            Type: Wait
+            Seconds: 300
+            Next: complete-lifecycle-hook
+
+          complete-lifecycle-hook:
+            Type: Task
+            End: true
+            Resource: "arn:aws:lambda:#{AWS::Region}:#{AWS::AccountId}:function:${self:provider.stage}-complete-lifecycle-hook"
+            Catch:
+              - ErrorEquals:
+                  - "States.ALL"
+                Next: failure
+            Retry:
+              - ErrorEquals:
+                  - "States.ALL"
+                MaxAttempts: 0
+
+          failure:
+            Type: Fail
